@@ -1,0 +1,16 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: report-service
+
+  datasource:
+    url: ${CLICKHOUSE_URL:jdbc:clickhouse://clickhouse:8123/airflow?compress=0}
+    username: ${CLICKHOUSE_USER:airflow}
+    password: ${CLICKHOUSE_PASSWORD:airflow}
+    driver-class-name: com.clickhouse.jdbc.ClickHouseDriver
+
+  sql:
+    init:
+      mode: never
