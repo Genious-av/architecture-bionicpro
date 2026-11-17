@@ -1,4 +1,34 @@
+
 version: '3.8'
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./Task2
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'your_airflow_webserver_sec_key'
+    _PIP_ADDITIONAL_REQUIREMENTS: ''
+    AIRFLOW_INPUT_DIR: '/opt/airflow/dag-inputs'
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_PORT: 8123
+    CLICKHOUSE_USER: airflow
+    CLICKHOUSE_PASSWORD: airflow
+    CLICKHOUSE_DATABASE: airflow
+  volumes:
+    - ./Task2/dags:/opt/airflow/dags
+    - ./Task2/dags/sql:/opt/airflow/dags/sql
+    - ./Task2/requirements.txt:/opt/airflow/requirements.txt
+    - ./Task2/data:/opt/airflow/sample_files
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - dag_sample
 
 services:
   keycloak_db:
@@ -11,6 +41,12 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    restart: always
+    networks:
+      - dag_sample
+
+
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,7 +56,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+    command:
       - start-dev
       - --import-realm
     volumes:
@@ -29,6 +65,12 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+    restart: always
+    networks:
+      - dag_sample
+
+
+
   frontend:
     build:
       context: ./frontend
@@ -36,7 +78,171 @@ services:
     ports:
       - "3000:3000"
     environment:
-      REACT_APP_API_URL: http://localhost:8000
+      REACT_APP_API_URL: http://localhost:8090
       REACT_APP_KEYCLOAK_URL: http://localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    depends_on:
+      - keycloak
+    networks:
+      - dag_sample
+
+  postgres:
+    image: postgres:16.0
+    volumes:
+      - ./Task2/db/init-db.sql:/docker-entrypoint-initdb.d/db.sql
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - dag_sample
+
+
+
+  airflow-webserver:
+    <<: *airflow-common
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    healthcheck:
+      test: >-
+        curl -f http://localhost:8080/health || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: >-
+        airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+
+  airflow-triggerer:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: airflow triggerer
+    healthcheck:
+      test: >-
+        airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - airflow
+
+
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+  
+        if ! airflow users list | grep -q 'admin'; then
+          airflow users create \
+            --username admin \
+            --firstname admin \
+            --lastname admin \
+            --role Admin \
+            --email admin@sample.ru \
+            --password admin
+        else
+          echo "Airflow user admin already exists, skipping"
+        fi
+  report-service:
+    build:
+      context: ./report-service
+      dockerfile: Dockerfile
+    container_name: report-service
+    ports:
+      - "8090:8090"
+    environment:
+      CLICKHOUSE_URL: jdbc:clickhouse://clickhouse:8123/airflow?compress=0
+      CLICKHOUSE_USER: airflow
+      CLICKHOUSE_PASSWORD: airflow
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - dag_sample
+
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_DB: airflow
+      CLICKHOUSE_USER: airflow
+      CLICKHOUSE_PASSWORD: airflow
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./Task2/clickhouse-data:/var/lib/clickhouse
+      - ./Task2/clickhouse-logs:/var/log/clickhouse-server
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - clickhouse-client --user airflow --password airflow --query "SELECT 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: always
+    networks:
+      - dag_sample
+networks:
+  dag_sample:
+    driver: bridge
